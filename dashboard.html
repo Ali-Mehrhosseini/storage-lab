@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Storage Lab · Experiments</title>
+<style>
+:root{color-scheme:light;--ink:#18362c;--line:#cad7cf;--green:#14593e}*{box-sizing:border-box}body{margin:0;background:#f2f5ef;color:var(--ink);font:16px/1.5 "Inter",system-ui,sans-serif}header,main{max-width:1100px;margin:auto;padding:24px}header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}header strong{letter-spacing:-.035em;font-size:22px}a{color:var(--green)}h1{font-size:clamp(30px,5vw,48px);letter-spacing:-.05em;line-height:1.05;margin:22px 0 12px}h2{font-size:20px;margin:0 0 12px}section{border:1px solid var(--line);border-radius:12px;padding:22px;margin-top:24px;background:white}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px 8px;vertical-align:top}th{color:#486254}button{background:var(--green);color:white;border:0;border-radius:6px;padding:10px 15px;font:inherit;cursor:pointer}button.secondary{background:#e8f0ea;color:var(--ink);padding:5px 10px}button:disabled{opacity:.55;cursor:wait}button:focus-visible,a:focus-visible{outline:3px solid #cb8128;outline-offset:3px}#message{min-height:1.5em}code{overflow-wrap:anywhere}p{max-width:78ch}
+</style>
+<header><strong>Storage Lab</strong><a href="/results.csv" download>Export CSV ↓</a></header>
+<main><h1>Persistence experiments</h1>
+<p>Write a 1 MiB sample and verify its checksum. After replacing the storage pod, read the same file again.</p>
+<p>Target · <strong id="backend">Loading…</strong></p>
+<button id="start" disabled>Upload and verify</button>
+<div role="status" id="message"></div>
+<section><h2>Run history</h2><div class="table"><table><thead><tr><th>Started (UTC)</th><th>Backend</th><th>Latest result</th><th>Actions</th></tr></thead><tbody id="runs"></tbody></table></div></section>
+<section id="detail" hidden><h2>Request evidence</h2><p id="metadata"></p><div class="table"><table><thead><tr><th>Stage</th><th>Method</th><th>HTTP</th><th>Time (ms)</th><th>Pod / node</th><th>Result</th></tr></thead><tbody id="requests"></tbody></table></div></section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+let selected, busy = false;
+async function api(path, method="GET") {
+  const response = await fetch(path,{method,cache:"no-store"});
+  if (!response.ok) throw new Error((await response.json()).detail || response.statusText);
+  return response.json();
+}
+function cell(row,value) { row.insertCell().textContent = value; }
+function button(parent,label,action) {
+  const b = document.createElement("button"); b.className="secondary"; b.textContent=label;
+  b.disabled=busy; b.onclick=()=>perform(action); parent.append(b," ");
+}
+async function refresh() {
+  const data=await api("/api/runs"); el("backend").textContent=data.backend;
+  const rows=el("runs"); rows.replaceChildren();
+  for (const run of data.runs) {
+    const row=rows.insertRow(); cell(row,run.started.replace("T"," ").slice(0,19)); cell(row,run.backend); cell(row,run.state);
+    const actions=row.insertCell();
+    button(actions,"Inspect",async()=>{selected=run.id});
+    if (!["Interrupted","Baseline failed","Preparing"].includes(run.state))
+      button(actions,"Verify existing file",async()=>{selected=run.id; await api("/api/runs/"+run.id+"/verify","POST")});
+  }
+  if (!data.runs.length) cell(rows.insertRow(),"No experiments recorded yet.");
+  const run=data.runs.find(r=>r.id===selected);
+  el("detail").hidden=!run;
+  if (run) {
+    const events=await api("/api/runs/"+run.id+"/requests");
+    el("metadata").textContent="Run "+run.id+" · Runner "+run.runner+" · Expected SHA-256 "+run.sha256;
+    el("metadata").style.overflowWrap="anywhere"; el("requests").replaceChildren();
+    for (const e of events) {
+      const row=el("requests").insertRow();
+      for (const v of [e.stage,e.method,e.status??"—",e.elapsed_ms.toFixed(2),[e.pod_name,e.node].filter(Boolean).join(" / ")||"Local",e.error||(e.method==="GET"?"Checksum matched":"Acknowledged")]) cell(row,v);
+    }
+  }
+}
+async function perform(action) {
+  if (busy) return; busy=true;
+  document.querySelectorAll("button").forEach(b=>b.disabled=true); el("message").textContent="Working…";
+  try { await action(); await refresh(); el("message").textContent=""; }
+  catch(error) { el("message").textContent=error.message; }
+  finally {busy=false; document.querySelectorAll("button").forEach(b=>b.disabled=false);}
+}
+el("start").onclick=()=>perform(async()=>{selected=(await api("/api/runs","POST")).id});
+perform(async()=>{});
+</script></html>
