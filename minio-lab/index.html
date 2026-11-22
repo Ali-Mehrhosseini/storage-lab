@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Storage Lab · S3</title>
+<style>
+:root{color-scheme:light;--ink:#18362c;--line:#cad7cf;--green:#14593e}*{box-sizing:border-box}body{margin:0;background:#f2f5ef;color:var(--ink);font:16px/1.5 "Inter",system-ui,sans-serif}header,main{max-width:1100px;margin:auto;padding:24px}header{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}header strong{letter-spacing:-.035em;font-size:22px}a{color:var(--green)}h1{font-size:clamp(30px,5vw,48px);letter-spacing:-.05em;line-height:1.05;margin:22px 0 12px}h2{font-size:20px;margin:0 0 12px}section{border:1px solid var(--line);border-radius:12px;padding:22px;margin-top:24px;background:white}.table{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px 8px;vertical-align:top}th{color:#486254}button{background:var(--green);color:white;border:0;border-radius:6px;padding:10px 15px;font:inherit;cursor:pointer}button.secondary{background:#e8f0ea;color:var(--ink);padding:5px 10px}button:disabled{opacity:.55;cursor:wait}button:focus-visible,a:focus-visible{outline:3px solid #cb8128;outline-offset:3px}#message{min-height:1.5em}code{overflow-wrap:anywhere}p{max-width:78ch}
+
+form{display:flex;align-items:end;flex-wrap:wrap;gap:10px}
+label{display:block;margin-bottom:4px;font-size:14px}
+input{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;width:min(100%,345px)}
+.field{width:min(100%,345px)}
+.size-field{width:110px}
+select{width:auto;font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:white;color:var(--ink)}
+#message{margin-top:12px}
+#download{display:inline-block;margin-top:14px}
+td code{overflow-wrap:anywhere}
+</style>
+<header><strong>Storage Lab</strong></header>
+<main>
+  <h1>S3 object storage</h1>
+  <p>Upload a test sample and verify its SHA-256 checksum on MinIO or Amazon S3.</p>
+  <p id="bucket">Loading buckets…</p>
+  <form id="upload">
+    <div>
+      <label for="backend">Target</label>
+      <select id="backend">
+        <option value="minio">MinIO</option>
+        <option value="aws">Amazon S3</option>
+      </select>
+    </div>
+    <div class="size-field">
+      <label for="sample-size">Sample size</label>
+      <input id="sample-size" type="number" value="1" min="1" max="16" step="1" required>
+    </div>
+    <div>
+      <label for="size-unit">Unit</label>
+      <select id="size-unit">
+        <option value="1024" selected>MiB</option>
+        <option value="1">KiB</option>
+      </select>
+    </div>
+    <button id="start" type="submit">Upload and verify</button>
+    <button id="compare" type="submit" class="secondary">Compare both · 3 trials</button>
+  </form>
+  <div id="message" role="status" aria-live="polite"></div>
+  <section>
+    <h2>Verify an existing sample</h2>
+    <form id="verify">
+      <div>
+        <label for="verify-backend">Target</label>
+        <select id="verify-backend">
+          <option value="minio">MinIO</option>
+          <option value="aws">Amazon S3</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="run-id">Run ID</label>
+        <input id="run-id" required pattern="[a-f0-9]{32}" maxlength="32"
+          autocomplete="off" autocapitalize="none" spellcheck="false">
+      </div>
+      <button type="submit" class="secondary">Verify existing object</button>
+    </form>
+  </section>
+  <section id="result" hidden>
+    <h2 id="result-title">Request evidence</h2>
+    <div class="table"><table><tbody id="evidence"></tbody></table></div>
+    <a id="download" download>Download sample ↓</a>
+  </section>
+  <section id="comparison" hidden>
+    <h2>Performance comparison</h2>
+    <p id="comparison-context"></p>
+    <div class="table">
+      <table>
+        <thead><tr><th scope="col">Backend</th><th scope="col">Median PUT</th><th scope="col">Median GET</th></tr></thead>
+        <tbody id="medians"></tbody>
+      </table>
+    </div>
+    <details>
+      <summary>Individual trials</summary>
+      <div class="table">
+        <table>
+          <thead><tr><th scope="col">Trial</th><th scope="col">Backend</th><th scope="col">Run ID</th><th scope="col">PUT</th><th scope="col">GET</th><th scope="col">Result</th></tr></thead>
+          <tbody id="trials"></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const number = new Intl.NumberFormat("en");
+const labels = {minio: "MinIO", aws: "Amazon S3"};
+let buckets = {};
+let maxSizeKib = 16 * 1024;
+
+function timing(value) {
+  return value == null ? "—" : value.toFixed(2) + " ms";
+}
+
+function samplePath(runId, backend, suffix = "") {
+  return "/api/runs/" + encodeURIComponent(runId) + suffix + "?backend=" + encodeURIComponent(backend);
+}
+
+function showBuckets() {
+  const backend = el("backend").value;
+  el("bucket").textContent = labels[backend] + " bucket · " + (buckets[backend] ?? "Unconfigured");
+}
+
+async function api(path, method = "GET", body) {
+  const options = {method, cache: "no-store"};
+  if (body !== undefined) {
+    options.headers = {"Content-Type": "application/json"};
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(typeof data.detail === "string" ? data.detail : "Request failed (" + response.status + ").");
+  }
+  return response.json();
+}
+
+function render(run) {
+  el("run-id").value = run.id;
+  el("verify-backend").value = run.backend;
+  el("result-title").textContent = run.matched ? "Checksum matched" : "Checksum verification failed";
+  const table = el("evidence");
+  table.replaceChildren();
+  const values = [
+    ["Backend", labels[run.backend]], ["Bucket", run.bucket], ["Client", run.client],
+    ["Run ID", run.id], ["Object key", run.key],
+    ["Bytes", number.format(run.bytes)], ["Expected SHA-256", run.expected_sha256 ?? "Unavailable"],
+    ["Read-back SHA-256", run.sha256],
+    ["S3 upload (PUT)", timing(run.put_ms)],
+    ["S3 read (GET)", timing(run.get_ms)],
+  ];
+  for (const [label, value] of values) {
+    const row = table.insertRow();
+    const heading = document.createElement("th");
+    heading.scope = "row";
+    heading.textContent = label;
+    row.append(heading);
+    const code = document.createElement("code");
+    code.textContent = value;
+    row.insertCell().append(code);
+  }
+  el("download").href = samplePath(run.id, run.backend, "/download");
+  el("result").hidden = false;
+}
+
+function renderComparison(result) {
+  el("comparison-context").textContent = number.format(result.bytes) + " bytes per sample · Client " +
+    result.client + " · " + result.verified_pairs + " of " + result.pairs.length +
+    " paired trials verified. Medians use verified pairs.";
+  const medians = el("medians");
+  medians.replaceChildren();
+  for (const [backend, values] of Object.entries(result.medians)) {
+    const row = medians.insertRow();
+    for (const value of [labels[backend], timing(values.put_ms), timing(values.get_ms)]) {
+      row.insertCell().textContent = value;
+    }
+  }
+  const trials = el("trials");
+  trials.replaceChildren();
+  for (const [index, pair] of result.pairs.entries()) {
+    for (const run of pair) {
+      const row = trials.insertRow();
+      for (const value of [
+        index + 1, labels[run.backend], run.id, timing(run.put_ms), timing(run.get_ms),
+        run.error ?? (run.matched ? "Checksum matched" : "Checksum mismatch"),
+      ]) {
+        row.insertCell().textContent = value;
+      }
+    }
+  }
+  el("comparison").hidden = false;
+}
+
+async function perform(action, show = render) {
+  const buttons = document.querySelectorAll("button");
+  buttons.forEach(button => button.disabled = true);
+  el("message").textContent = "Working…";
+  el("result").hidden = true;
+  el("comparison").hidden = true;
+  try {
+    show(await action());
+    el("message").textContent = "";
+  } catch (error) {
+    el("message").textContent = error.message;
+  } finally {
+    buttons.forEach(button => button.disabled = false);
+    el("compare").disabled = !buckets.minio || !buckets.aws;
+  }
+}
+
+el("compare").disabled = true;
+el("backend").onchange = showBuckets;
+el("size-unit").onchange = () => {
+  el("sample-size").max = Math.floor(maxSizeKib / Number(el("size-unit").value));
+};
+el("upload").onsubmit = event => {
+  event.preventDefault();
+  const sizeKib = el("sample-size").valueAsNumber * Number(el("size-unit").value);
+  if (event.submitter === el("compare")) {
+    perform(() => api("/api/comparisons", "POST", {size_kib: sizeKib}), renderComparison);
+  } else {
+    perform(() => api("/api/runs", "POST", {size_kib: sizeKib, backend: el("backend").value}));
+  }
+};
+el("verify").onsubmit = event => {
+  event.preventDefault();
+  perform(() => api(samplePath(el("run-id").value, el("verify-backend").value)));
+};
+api("/api/target").then(data => {
+  buckets = data.buckets;
+  showBuckets();
+  el("compare").disabled = !buckets.minio || !buckets.aws;
+  maxSizeKib = data.max_size_kib;
+  el("size-unit").onchange();
+}).catch(() => {
+  el("bucket").textContent = "Unavailable";
+});
+</script>
+</html>
